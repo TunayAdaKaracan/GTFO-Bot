@@ -3,6 +3,7 @@ import discord
 from discord.ext import tasks
 import asyncpg
 import datetime
+import pytz
 import re
 from util import parseDate, RoomStates
 
@@ -12,9 +13,9 @@ class ArcClient(discord.Bot):
         intents = discord.Intents.all()
         super().__init__(intents=intents)
         self.pool: asyncpg.Pool = None
-        self.debug_guilds = [844842869285847060]
-        self.logging_channel = 988516254983802890
-        self.category = 844887572307640331
+        self.debug_guilds = [844842869285847060, 921444090187489311]
+        self.logging_channel = 1062741349159411752
+        self.category = 1062741705562001502
 
 
 client = ArcClient()
@@ -28,14 +29,13 @@ denyPermission = discord.PermissionOverwrite()
 denyPermission.connect = False
 denyPermission.speak = False
 
-
 @group.command(name="oluştur", description="Oda oluşturun")
 async def oda_olustur(ctx: discord.ApplicationContext, tarih: discord.Option(str, required=True, description="Şuandan itibaren ne kadar sonra başlamasını istediğinizi yazın. (5gün 3dk 2sn 21saat)"), bölüm: discord.Option(str, default="Herhangi"), kilit: discord.Option(bool, description="Oda açıldığında kilitlensin mi?", default=False)):
     if re.match("[0-9]{1,2}:[0-9]{1,2}", tarih):
 
         hour = tarih.split(":")[0]
         minute = tarih.split(":")[1]
-        date = datetime.datetime.now()
+        date = datetime.datetime.now(tz=pytz.timezone("Europe/Istanbul"))
         date = date.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
     else:
         total, err = parseDate(tarih)
@@ -57,25 +57,28 @@ async def oda_sil(ctx: discord.ApplicationContext, id: discord.Option(int, requi
         return await ctx.respond(embed=errorEmbed("Odanın host'u değilsiniz.", "Odaları sadece oda host'ları silebilir"), ephemeral=True)
     async with client.pool.acquire() as db:
         await db.execute("delete from rooms where id=$1", room['id'])
+    ch = discord.utils.get(client.get_channel(client.category).voice_channels, name="GTFO-"+str(room["id"]))
+    if ch is not None:
+        await ch.delete()
     await ctx.respond(embed=successEmbed("Oda silindi", f"Hostladığınız {id} numaralı odayı başarıyla sildiniz!"), ephemeral=True)
 
 
 class RoomJoin(discord.ui.Button):
     def __init__(self, roomID, userID, roomData, page):
+        super().__init__(style=discord.ButtonStyle.green, custom_id="joinbutton")
         self.room_id = roomID
         self.user_id = userID
         self.page = page
-        super().__init__(style=discord.ButtonStyle.green)
         self.action_type = 0 if userID not in roomData["participants"] else 1
         self.label = "Odaya katıl" if self.action_type == 0 else "Odadan ayrıl"
         self.disabled = True if (self.action_type == 0 and len(roomData["participants"]) == 4) or roomData["state"] != 0 else False
 
     async def callback(self, interaction: discord.Interaction):
         room = await getroombyid(self.room_id)
-        if len(room["participants"]) == 4:
+        if len(room["participants"]) == 4 && self.action_type == 0:
             self.disabled = True
-            await interaction.response.send_message(embed=errorEmbed("Oda dolu!", "Bu oda çoktan dolmuş Bu odaya katılamazsın."), ephemeral=True)
-            return await self.view.message.edit(view=self.view)
+            await interaction.response.edit_message(view=self.view)
+            return await interaction.followup.send(embed=errorEmbed("Oda dolu!", "Bu oda çoktan dolmuş Bu odaya katılamazsın."), ephemeral=True)
 
         if self.action_type == 0:
             room["participants"].append(interaction.user.id)
@@ -84,37 +87,42 @@ class RoomJoin(discord.ui.Button):
                     await db.execute("update rooms set participants=$1, state=1 where id=$2", room["participants"], self.room_id)
                 else:
                     await db.execute("update rooms set participants=$1 where id=$2", room["participants"], self.room_id)
-            await interaction.response.send_message(embed=successEmbed("Odaya katıldın!", "Bu odaya katıldın. Oyunun başlayacağı tarihte sana bir ping atılacak!"), ephemeral=True)
+
+            embed = discord.Embed(title=f"{room['id']} numaralı oda")
+            embed.colour = discord.Color.blurple()
+            embed.description = f"**Oda Numarası**: `{room['id']}`\n**Oda Sahibi**: {client.get_user(room['host']).name}\n**Bölüm**: {room['rundown']}\n**Katılımcılar**: {', '.join([user.mention for user in [client.get_user(user) for user in room['participants']]])}\n**Durum**: {RoomStates.fromId(room['state']).desc}\n**Başlama Tarihi**: <t:{int(room['date'].timestamp())}:R>"
+            await interaction.response.edit_message(embed=embed, view=RoomView(room, self.user_id, self.page))
+
+            await interaction.followup.send(embed=successEmbed("Odaya katıldın!", "Bu odaya katıldın. Oyunun başlayacağı tarihte sana bir ping atılacak!"), ephemeral=True)
             try:
                 await client.get_user(room["host"]).send(f"{client.get_user(self.user_id).mention} `{room['id']}` numaralı odanıza katıldı.")
             except:
                 pass
         else:
             if self.user_id == room["host"]:
-                await interaction.response.send_message(embed=errorEmbed("Hata", "Kendi hostladığın odadan çıkamazsın!"), ephemeral=True)
                 self.disabled = True
-                return await self.view.message.edit(view=self.view)
+                await interaction.response.edit_message(view=self.view)
+                return await interaction.followup.send(embed=errorEmbed("Hata", "Kendi hostladığın odadan çıkamazsın!"), ephemeral=True)
 
             room["participants"].remove(interaction.user.id)
             async with client.pool.acquire() as db:
                 await db.execute("update rooms set participants=$1, state=0 where id=$2", room["participants"], self.room_id)
 
-            await interaction.response.send_message(embed=successEmbed("Odadan ayrıldın!", "Bu odadan ayrıldın."), ephemeral=True)
+            embed = discord.Embed(title=f"{room['id']} numaralı oda")
+            embed.colour = discord.Color.blurple()
+            embed.description = f"**Oda Numarası**: `{room['id']}`\n**Oda Sahibi**: {client.get_user(room['host']).name}\n**Bölüm**: {room['rundown']}\n**Katılımcılar**: {', '.join([user.mention for user in [client.get_user(user) for user in room['participants']]])}\n**Durum**: {RoomStates.fromId(room['state']).desc}\n**Başlama Tarihi**: <t:{int(room['date'].timestamp())}:R>"
+            await interaction.response.edit_message(embed=embed, view=RoomView(room, self.user_id, self.page))
+
+            await interaction.followup.send(embed=successEmbed("Odadan ayrıldın!", "Bu odadan ayrıldın."), ephemeral=True)
             try:
                 await client.get_user(room["host"]).send(f"{client.get_user(self.user_id).mention} `{room['id']}` numaralı odanızdan ayrıldı.")
             except:
                 pass
-        embed = discord.Embed(title=f"{room['id']} numaralı oda")
-        embed.colour = discord.Color.blurple()
-        embed.description = f"**Oda Numarası**: `{room['id']}`\n**Oda Sahibi**: {client.get_user(room['host']).name}\n**Bölüm**: {room['rundown']}\n**Katılımcılar**: {', '.join([user.mention for user in [client.get_user(user) for user in room['participants']]])}\n**Durum**: {RoomStates.fromId(room['state']).desc}\n**Başlama Tarihi**: <t:{int(room['date'].timestamp())}:R>"
-        await self.view.message.edit(embed=embed, view=RoomView(room, self.user_id, self.page,self.view.message))
 
 
 class RoomView(discord.ui.View):
-    def __init__(self, roomdata, user_id, page, message = None):
+    def __init__(self, roomdata, user_id, page):
         super().__init__()
-        if message is not None:
-            self.message = message
         self.page = page
         self.add_item(RoomJoin(roomdata["id"], user_id, roomdata, self.page))
 
@@ -133,23 +141,27 @@ class RoomView(discord.ui.View):
 
 class RoomSelect(discord.ui.Select):
     def __init__(self, data):
-        super().__init__(placeholder="Oda seç")
+        super().__init__(placeholder="Oda seç", custom_id="room_select")
+
         for roomdata in data:
             host = client.get_user(roomdata["host"])
             self.add_option(label=f"Oda {roomdata['id']}", value=str(roomdata["id"]), description=f"{host.name} adlı kullanıcının odası.")
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id not in tmpStorage:
+            tmpStorage[interaction.user.id] = self.view.message
+
         id = int(self.values[0])
         room = await getroombyid(id)
         embed = discord.Embed(title=f"{id} numaralı oda")
         embed.colour = discord.Color.blurple()
         embed.description = f"**Oda Numarası**: `{id}`\n**Oda Sahibi**: {client.get_user(room['host']).name}\n**Bölüm**: {room['rundown']}\n**Katılımcılar**: {', '.join([user.mention for user in [client.get_user(user) for user in room['participants']]])}\n**Durum**: {RoomStates.fromId(room['state']).desc}\n**Başlama Tarihi**: <t:{int(room['date'].timestamp())}:R>"
-        await interaction.response.send_message(embed=embed, view=RoomView(room, interaction.user.id, self.view.page), ephemeral=True)
+        await interaction.response.edit_message(embed=embed, view=RoomView(room, interaction.user.id, self.view.page))
 
 
 class RightButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(style=discord.ButtonStyle.blurple, label="Sonraki sayfaya git", row=2)
+        super().__init__(style=discord.ButtonStyle.blurple, label="Sonraki sayfaya git", row=2, custom_id="right_button")
 
     async def callback(self, interaction: discord.Interaction):
         self.view.page += 1
@@ -166,7 +178,7 @@ class RightButton(discord.ui.Button):
 
 class LeftButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(style=discord.ButtonStyle.blurple, label="Önceki sayfaya git", row=2)
+        super().__init__(style=discord.ButtonStyle.blurple, label="Önceki sayfaya git", row=2, custom_id="left_button")
 
     async def callback(self, interaction: discord.Interaction):
         self.view.page -= 1
@@ -302,5 +314,7 @@ async def on_ready():
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     client.pool = loop.run_until_complete(
-        asyncpg.create_pool(user='postgres', password='kutup', database='gtfo', host='127.0.0.1'))
+        asyncpg.create_pool(user='kutup', password='kutup', database='gtfo', host='127.0.0.1'))
+    
     client.run("")
+
